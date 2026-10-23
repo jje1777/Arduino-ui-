@@ -1,0 +1,1303 @@
+#include <Arduino_GFX_Library.h>
+#include <TouchScreen.h>
+#include <EEPROM.h>
+#include <WiFiS3.h>
+#include <Modulino.h>
+
+// --- DISCORD WEBHOOK CONFIGURATION ---
+const char* discordHost = "discord.com";
+String discordPath = "/api/webhooks/1561150046144041053/qhdSjFkPNDhrE-_IKQ_surrYGsnH1JBghzMDW-o_x1Xmpw7hr5MIldkFgIhwamsHBXjW";
+
+// --- MODULINO MODULES (Buzzer Only) ---
+ModulinoBuzzer buzzer;
+
+// --- SHIELD HARDWARE PINS ---
+#define YP A3
+#define XM A2
+#define YM 9
+#define XP 8
+
+#define MINPRESSURE 10
+#define MAXPRESSURE 1000
+
+// Touch Calibration for Landscape
+#define TS_MINX 120
+#define TS_MAXX 900
+#define TS_MINY 70
+#define TS_MAXY 920
+
+#define TFT_RST A4
+#define TFT_BACKLIGHT_PIN 3
+
+// --- EEPROM ADDRESSES ---
+#define EEPROM_THEME_ADDR  0
+#define EEPROM_PIN_FLAG    98
+#define EEPROM_PIN_ADDR    99
+#define EEPROM_LAYOUT_FLAG 109
+#define EEPROM_LAYOUT_ADDR 110 // Stores 18 slots across 3 pages
+#define EEPROM_NOTES_FLAG  128
+#define EEPROM_NOTES_ADDR  129 // Stores up to 100 characters
+#define EEPROM_VOL_ADDR    230
+#define EEPROM_BRIGHT_ADDR 231
+
+// Bus and Display Setup
+Arduino_DataBus *bus = new Arduino_UNOPAR8();
+Arduino_GFX *gfx = new Arduino_ILI9341(bus, TFT_RST, 1 /* rotation */);
+TouchScreen ts = TouchScreen(XP, YP, XM, YM, 300);
+
+// Global System Settings
+int systemVolume = 80;      // Percentage (0-100)
+int screenBrightness = 255; // PWM value (0-255)
+
+// Weather & Crypto Variables
+float outdoorTempC = 0.0;
+String weatherCondition = "Unknown";
+float btcPriceUSD = 0.0;
+
+// Virtual Touch Trigger
+bool remoteTouchPending = false;
+int remoteTouchX = -1, remoteTouchY = -1;
+
+// --- APP MODES ---
+int currentMode = 0; 
+int currentTheme = 0;
+int keyboardReturnMode = 6;
+
+// Sub-Tab Toggle States
+int timerSubTab = 0;    // 0 = Timer, 1 = Stopwatch
+int storageSubTab = 0;  // 0 = EEPROM Storage, 1 = Telemetry
+
+// --- TIMER & STOPWATCH VARIABLES ---
+int initialTimerSeconds = 25 * 60;
+int totalSeconds = 25 * 60;
+bool timerRunning = false;
+unsigned long previousMillis = 0;
+
+bool swRunning = false;
+unsigned long swStartTime = 0;
+unsigned long swElapsed = 0;
+unsigned long swLaps[3] = {0, 0, 0};
+int swLapCount = 0;
+
+// --- FLASHLIGHT / SIGNAL LIGHT VARIABLES ---
+int flashlightMode = 0; // 0 = White, 1 = Red, 2 = Green, 3 = SOS Strobe
+bool sosState = false;
+unsigned long lastSosToggle = 0;
+
+// --- DICE & RNG APP VARIABLES ---
+int rngMin = 1;
+int rngMax = 6;
+int lastRngResult = 0;
+
+// --- HOME SCREEN NAVIGATION & LAYOUT ---
+int homePage = 0;
+int homeLayout[18] = {
+  1, 2, 3, 17, 18, 20,       // Page 1
+  14, 4, 22, 23, 24, 25,     // Page 2
+  21, 26, 27, 0, 0, 0        // Page 3
+};
+int selectedSwapSlot = -1;
+
+// --- CONVERTER APP VARIABLES ---
+float convertVal = 100.0;
+int convertMode = 0; 
+
+// --- PASSCODE & LOCK VARIABLES ---
+String savedPIN = "1234";
+String pinEntryInput = "";
+String tempNewPIN = "";
+bool isLocked = false;
+unsigned long lastActivityTime = 0;
+
+// --- TEXT ENTRY & DISCORD ---
+String enteredPassword = "";
+String customDiscordText = "";
+String lastSentDiscordMsg = "None";
+String incomingDiscordMsg = "";
+String popupTitle = "DESKTOP NOTIFICATION";
+
+// --- NOTES APP ---
+String userNote = "Tap 'Edit Note' to write...";
+
+// --- CALCULATOR ---
+String calcInput = "";
+float num1 = 0, num2 = 0;
+char op = ' ';
+
+// --- DRAWING PAD ---
+uint16_t currentColor = 0xF800;
+int brushSize = 2;
+int lastX = -1, lastY = -1;
+
+// --- TIC-TAC-TOE ---
+char tttBoard[3][3];
+bool tttGameOver = false;
+String tttStatus = "YOUR TURN (X)";
+int tttScoreX = 0, tttScoreO = 0;
+
+// --- DINO GAME ---
+int dinoY = 160;
+int dinoVelocity = 0;
+bool isJumping = false;
+int cactusX = 320;
+int dinoScore = 0;
+int dinoHighScore = 0;
+bool dinoGameOver = false;
+unsigned long lastDinoFrame = 0;
+
+// --- DYNAMIC THEME & CONSTANT COLORS ---
+uint16_t COLOR_BG, COLOR_CARD_BG, COLOR_TEXT, COLOR_TEXT_DIM, COLOR_ACCENT, COLOR_GREEN, COLOR_RED, COLOR_ORANGE;
+#define COLOR_YELLOW 0xFFE0
+#define COLOR_BLUE   0x001F
+
+// --- FORWARD DECLARATIONS ---
+void rebootSystem();
+void lockSystem();
+void drawHomeScreen();
+void drawPasscodePadUI(String title);
+void updateHeaderStatus();
+void drawKeyboardUI();
+void drawNotesUI();
+void drawCryptoUI();
+void drawSettingsUI();
+void drawGamesMenuUI();
+void drawStorageManagerUI();
+void drawSlidersUI();
+void drawConverterUI();
+void drawSoundBoardUI();
+void drawTimerUI();
+void drawFlashlightUI();
+void drawDiceRNGUI();
+void drawWeatherUI();
+void drawWiFiStatusUI();
+
+void applyTheme(int themeIdx) {
+  currentTheme = themeIdx;
+  switch (currentTheme) {
+    case 0: COLOR_BG=0x10A2; COLOR_CARD_BG=0x2128; COLOR_TEXT=0xFFFF; COLOR_TEXT_DIM=0x9492; COLOR_ACCENT=0x3B1F; COLOR_GREEN=0x2E6B; COLOR_RED=0xE208; COLOR_ORANGE=0xFCE0; break;
+    case 1: COLOR_BG=0xE71C; COLOR_CARD_BG=0xFFFF; COLOR_TEXT=0x10A2; COLOR_TEXT_DIM=0x6B5D; COLOR_ACCENT=0x347D; COLOR_GREEN=0x2EC8; COLOR_RED=0xE208; COLOR_ORANGE=0xFD20; break;
+    case 2: COLOR_BG=0x2800; COLOR_CARD_BG=0x5800; COLOR_TEXT=0xFFFF; COLOR_TEXT_DIM=0xF3E0; COLOR_ACCENT=0x9000; COLOR_GREEN=0x2EC8; COLOR_RED=0xF800; COLOR_ORANGE=0xFD20; break;
+    case 3: COLOR_BG=0x3180; COLOR_CARD_BG=0x6300; COLOR_TEXT=0xFFFF; COLOR_TEXT_DIM=0xFC00; COLOR_ACCENT=0xAC00; COLOR_GREEN=0x2EC8; COLOR_RED=0xE208; COLOR_ORANGE=0xFCE0; break;
+    case 4: COLOR_BG=0x01A0; COLOR_CARD_BG=0x0380; COLOR_TEXT=0xFFFF; COLOR_TEXT_DIM=0x87E0; COLOR_ACCENT=0x05A0; COLOR_GREEN=0x07E0; COLOR_RED=0xE208; COLOR_ORANGE=0xFD20; break;
+    case 5: COLOR_BG=0x180B; COLOR_CARD_BG=0x3813; COLOR_TEXT=0xFFFF; COLOR_TEXT_DIM=0xC3F7; COLOR_ACCENT=0x601B; COLOR_GREEN=0x2EC8; COLOR_RED=0xE208; COLOR_ORANGE=0xFD20; break;
+  }
+  if (EEPROM.read(EEPROM_THEME_ADDR) != currentTheme) {
+    EEPROM.write(EEPROM_THEME_ADDR, currentTheme);
+  }
+}
+
+void playTone(int freq = 1000, int duration = 50) {
+  if (currentMode != 3 && currentMode != 26 && systemVolume > 0) {
+    int scaledDuration = (duration * systemVolume) / 100;
+    buzzer.tone(freq, scaledDuration > 5 ? scaledDuration : 5);
+  }
+}
+
+void triggerWrongPasswordBuzzer() { playTone(250, 400); }
+
+extern "C" char* sbrk(int incr);
+int getFreeRam() {
+  char top;
+  return &top - sbrk(0);
+}
+
+void rebootSystem() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG);
+  gfx->setCursor(80, 100);
+  gfx->setTextColor(COLOR_RED);
+  gfx->setTextSize(3);
+  gfx->print("REBOOT...");
+  playTone(2000, 150);
+  delay(500);
+  NVIC_SystemReset();
+}
+
+// EEPROM Helpers
+void saveLayoutToEEPROM() {
+  EEPROM.write(EEPROM_LAYOUT_FLAG, 1);
+  for (int i = 0; i < 18; i++) {
+    EEPROM.write(EEPROM_LAYOUT_ADDR + i, homeLayout[i]);
+  }
+}
+
+void loadLayoutFromEEPROM() {
+  if (EEPROM.read(EEPROM_LAYOUT_FLAG) == 1) {
+    for (int i = 0; i < 18; i++) {
+      homeLayout[i] = EEPROM.read(EEPROM_LAYOUT_ADDR + i);
+    }
+  } else {
+    saveLayoutToEEPROM();
+  }
+}
+
+void saveNoteToEEPROM(String note) {
+  EEPROM.write(EEPROM_NOTES_FLAG, 1);
+  int len = note.length();
+  if (len > 99) len = 99;
+  for (int i = 0; i < len; i++) {
+    EEPROM.write(EEPROM_NOTES_ADDR + i, note[i]);
+  }
+  EEPROM.write(EEPROM_NOTES_ADDR + len, 0);
+}
+
+void loadNoteFromEEPROM() {
+  if (EEPROM.read(EEPROM_NOTES_FLAG) == 1) {
+    userNote = "";
+    for (int i = 0; i < 99; i++) {
+      char c = EEPROM.read(EEPROM_NOTES_ADDR + i);
+      if (c == 0) break;
+      userNote += c;
+    }
+  }
+}
+
+void savePINToEEPROM(String pin) {
+  EEPROM.write(EEPROM_PIN_FLAG, 1);
+  for (int i = 0; i < 4; i++) EEPROM.write(EEPROM_PIN_ADDR + i, i < pin.length() ? pin[i] : '0');
+}
+
+bool loadPINFromEEPROM(String &pin) {
+  if (EEPROM.read(EEPROM_PIN_FLAG) != 1) return false;
+  pin = "";
+  for (int i = 0; i < 4; i++) pin += (char)EEPROM.read(EEPROM_PIN_ADDR + i);
+  return true;
+}
+
+// UI & Icon Helpers
+void drawAppIcon(int x, int y, int appId, uint16_t color) {
+  int iconX = x + 35;
+  int iconY = y + 18;
+  
+  switch (appId) {
+    case 1:  gfx->fillRect(iconX - 6, iconY, 12, 3, color); gfx->fillRect(iconX - 1, iconY - 5, 3, 12, color); break;
+    case 2:  gfx->drawCircle(iconX, iconY, 8, color); gfx->drawLine(iconX, iconY, iconX, iconY - 4, color); gfx->drawLine(iconX, iconY, iconX + 4, iconY, color); break;
+    case 3:  gfx->drawLine(iconX - 6, iconY + 6, iconX + 6, iconY - 6, color); gfx->fillCircle(iconX + 6, iconY - 6, 2, color); break;
+    case 17: gfx->fillRoundRect(iconX - 8, iconY - 6, 16, 12, 3, color); gfx->fillTriangle(iconX - 4, iconY + 6, iconX, iconY + 6, iconX - 6, iconY + 10, color); break;
+    case 18: gfx->drawRect(iconX - 6, iconY - 7, 12, 14, color); gfx->drawFastHLine(iconX - 3, iconY - 3, 6, color); gfx->drawFastHLine(iconX - 3, iconY + 1, 6, color); break;
+    case 20: gfx->drawFastVLine(iconX, iconY - 7, 14, color); gfx->setCursor(iconX - 4, iconY - 5); gfx->setTextColor(color); gfx->setTextSize(1); gfx->print("S"); break;
+    case 21: gfx->drawCircle(iconX, iconY, 5, color); gfx->drawFastVLine(iconX, iconY - 8, 3, color); gfx->drawFastVLine(iconX, iconY + 6, 3, color); gfx->drawFastHLine(iconX - 8, iconY, 3, color); gfx->drawFastHLine(iconX + 6, iconY, 3, color); break;
+    case 14: gfx->fillRect(iconX - 7, iconY - 2, 14, 4, color); gfx->fillRect(iconX - 2, iconY - 7, 4, 14, color); break;
+    case 4:  gfx->drawRect(iconX - 6, iconY - 6, 12, 12, color); gfx->drawRect(iconX - 3, iconY - 3, 6, 6, color); break;
+    case 22: gfx->drawRect(iconX - 7, iconY - 6, 14, 12, color); gfx->fillRect(iconX - 4, iconY - 3, 8, 6, color); break;
+    case 23: gfx->drawFastHLine(iconX - 8, iconY - 4, 16, color); gfx->drawFastHLine(iconX - 8, iconY + 4, 16, color); gfx->fillCircle(iconX - 2, iconY - 4, 3, color); gfx->fillCircle(iconX + 3, iconY + 4, 3, color); break;
+    case 24: gfx->drawFastHLine(iconX - 6, iconY - 3, 12, color); gfx->drawFastHLine(iconX - 6, iconY + 3, 12, color); break;
+    case 25: gfx->fillRect(iconX - 6, iconY - 3, 4, 6, color); gfx->fillTriangle(iconX - 2, iconY - 3, iconX + 2, iconY - 7, iconX + 2, iconY + 7, color); break;
+    case 26: gfx->fillRoundRect(iconX - 5, iconY - 6, 10, 14, 2, color); gfx->fillTriangle(iconX - 5, iconY - 6, iconX + 5, iconY - 6, iconX, iconY - 10, color); break;
+    case 27: gfx->drawRoundRect(iconX - 7, iconY - 7, 14, 14, 3, color); gfx->fillCircle(iconX - 3, iconY - 3, 1, color); gfx->fillCircle(iconX + 3, iconY + 3, 1, color); gfx->fillCircle(iconX, iconY, 1, color); break;
+  }
+}
+
+void drawModernButton(int x, int y, int w, int h, uint16_t bgColor, String text, uint16_t textColor = COLOR_TEXT, int textSize = 2) {
+  gfx->fillRoundRect(x, y, w, h, 6, bgColor);
+  gfx->drawRoundRect(x, y, w, h, 6, COLOR_TEXT_DIM);
+  int textX = x + (w - (text.length() * 6 * textSize)) / 2;
+  int textY = y + (h - (8 * textSize)) / 2;
+  if (textX < x + 2) textX = x + 4;
+  gfx->setCursor(textX, textY);
+  gfx->setTextColor(textColor);
+  gfx->setTextSize(textSize);
+  gfx->print(text);
+}
+
+void drawHomeButton() {
+  if (currentMode != 0 && currentMode != 26) drawModernButton(272, 6, 42, 28, COLOR_ACCENT, "H", COLOR_TEXT, 2);
+}
+
+void drawBackButton() {
+  if (currentMode != 26) drawModernButton(6, 6, 38, 28, COLOR_CARD_BG, "<", COLOR_TEXT, 2);
+}
+
+void getWidgetDetails(int appId, String &name, uint16_t &color, uint16_t &textColor) {
+  textColor = COLOR_TEXT;
+  switch (appId) {
+    case 1:  name = "Calc";     color = COLOR_CARD_BG; break;
+    case 2:  name = "Timer";    color = COLOR_ACCENT;  break;
+    case 3:  name = "Draw";     color = COLOR_CARD_BG; break;
+    case 17: name = "Discord";  color = COLOR_ORANGE;  break;
+    case 18: name = "Notes";    color = COLOR_GREEN;   break;
+    case 20: name = "Crypto";   color = COLOR_CARD_BG; textColor = COLOR_ORANGE; break;
+    case 21: name = "Weather";  color = COLOR_CARD_BG; textColor = COLOR_GREEN;  break;
+    case 14: name = "Games";    color = COLOR_CARD_BG; break;
+    case 4:  name = "Config";   color = COLOR_CARD_BG; textColor = COLOR_TEXT_DIM; break;
+    case 22: name = "Storage";  color = COLOR_CARD_BG; textColor = COLOR_GREEN; break;
+    case 23: name = "Control";  color = COLOR_ACCENT;  break;
+    case 24: name = "Convert";  color = COLOR_CARD_BG; textColor = COLOR_ORANGE; break;
+    case 25: name = "Audio";    color = COLOR_ORANGE;  break;
+    case 26: name = "Light";    color = COLOR_CARD_BG; textColor = COLOR_YELLOW; break;
+    case 27: name = "Dice";     color = COLOR_CARD_BG; textColor = COLOR_ACCENT; break;
+    default: name = "Empty";    color = COLOR_CARD_BG; textColor = COLOR_TEXT_DIM; break;
+  }
+}
+
+// Reads existing Wi-Fi status on the upper right panel
+void updateHeaderStatus() {
+  gfx->fillRoundRect(15, 8, 290, 38, 6, COLOR_CARD_BG);
+  gfx->drawRoundRect(15, 8, 290, 38, 6, COLOR_TEXT_DIM);
+
+  bool isConn = (WiFi.status() == WL_CONNECTED);
+  gfx->setCursor(22, 18); 
+  gfx->setTextColor(isConn ? COLOR_GREEN : COLOR_RED); 
+  gfx->setTextSize(2); 
+  gfx->print(isConn ? "ONLINE" : "OFFLINE");
+
+  drawModernButton(108, 12, 30, 30, homePage == 0 ? COLOR_CARD_BG : COLOR_ACCENT, "<", COLOR_TEXT, 2);
+  gfx->setCursor(144, 20); gfx->setTextColor(COLOR_TEXT_DIM); gfx->setTextSize(1); gfx->print("P" + String(homePage + 1));
+  drawModernButton(165, 12, 30, 30, homePage == 2 ? COLOR_CARD_BG : COLOR_ACCENT, ">", COLOR_TEXT, 2);
+
+  gfx->setCursor(215, 18); 
+  gfx->setTextColor(COLOR_ACCENT); 
+  gfx->setTextSize(2); 
+  gfx->print(isConn ? "Net:OK" : "Net:--");
+}
+
+void drawHomeScreen() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); 
+  updateHeaderStatus();
+
+  int slotX[6] = {15, 117, 220, 15, 117, 220};
+  int slotY[6] = {54, 54, 54, 142, 142, 142};
+  int offset = homePage * 6;
+
+  for (int i = 0; i < 6; i++) {
+    int layoutIdx = offset + i;
+    if (homeLayout[layoutIdx] != 0) {
+      String name; uint16_t btnColor, textColor;
+      getWidgetDetails(homeLayout[layoutIdx], name, btnColor, textColor);
+      drawModernButton(slotX[i], slotY[i], 85, 75, btnColor, name, textColor, 2);
+      drawAppIcon(slotX[i], slotY[i], homeLayout[layoutIdx], textColor);
+    } else {
+      gfx->drawRoundRect(slotX[i], slotY[i], 85, 75, 6, COLOR_CARD_BG);
+    }
+  }
+}
+
+void drawWiFiStatusUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton(); drawBackButton();
+  gfx->setCursor(52, 12); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print("NETWORK INFO");
+
+  bool isConnected = (WiFi.status() == WL_CONNECTED);
+  gfx->fillRoundRect(15, 44, 290, 130, 6, COLOR_CARD_BG); 
+  gfx->drawRoundRect(15, 44, 290, 130, 6, COLOR_TEXT_DIM);
+
+  gfx->setCursor(30, 58); gfx->setTextSize(2); 
+  gfx->setTextColor(isConnected ? COLOR_GREEN : COLOR_RED);
+  gfx->print(isConnected ? "Connected" : "Not Connected");
+
+  if (isConnected) {
+    gfx->setCursor(30, 90); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(1);
+    gfx->print("SSID: "); gfx->print(WiFi.SSID());
+    gfx->setCursor(30, 110); gfx->print("IP: "); gfx->print(WiFi.localIP().toString());
+    gfx->setCursor(30, 130); gfx->print("Signal: "); gfx->print(WiFi.RSSI()); gfx->print(" dBm");
+  } else {
+    gfx->setCursor(30, 90); gfx->setTextColor(COLOR_TEXT_DIM); gfx->setTextSize(1);
+    gfx->print("Board is not connected to a network.");
+  }
+}
+
+// --- FLASHLIGHT / SIGNAL LIGHT APP ---
+void drawFlashlightUI() {
+  uint16_t lightColor = COLOR_TEXT;
+  if (flashlightMode == 1) lightColor = COLOR_RED;
+  else if (flashlightMode == 2) lightColor = COLOR_GREEN;
+  else if (flashlightMode == 3) lightColor = sosState ? COLOR_RED : COLOR_BG;
+
+  gfx->fillRect(0, 0, 320, 240, lightColor);
+  gfx->fillRoundRect(10, 195, 300, 38, 6, COLOR_CARD_BG);
+  gfx->drawRoundRect(10, 195, 300, 38, 6, COLOR_TEXT_DIM);
+
+  drawModernButton(15, 200, 65, 28, flashlightMode == 0 ? COLOR_ACCENT : COLOR_CARD_BG, "WHT", COLOR_TEXT, 1);
+  drawModernButton(85, 200, 65, 28, flashlightMode == 1 ? COLOR_RED : COLOR_CARD_BG, "RED", COLOR_TEXT, 1);
+  drawModernButton(155, 200, 65, 28, flashlightMode == 2 ? COLOR_GREEN : COLOR_CARD_BG, "GRN", COLOR_TEXT, 1);
+  drawModernButton(225, 200, 40, 28, flashlightMode == 3 ? COLOR_ORANGE : COLOR_CARD_BG, "SOS", COLOR_TEXT, 1);
+  drawModernButton(270, 200, 35, 28, COLOR_RED, "X", COLOR_TEXT, 1);
+}
+
+// --- DICE & RNG APP ---
+void drawDiceRNGUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton(); drawBackButton();
+  gfx->setCursor(52, 12); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print("DICE & RNG");
+
+  drawModernButton(15, 45, 65, 32, rngMax == 6 ? COLOR_ACCENT : COLOR_CARD_BG, "D6", COLOR_TEXT, 1);
+  drawModernButton(85, 45, 65, 32, rngMax == 20 ? COLOR_ACCENT : COLOR_CARD_BG, "D20", COLOR_TEXT, 1);
+  drawModernButton(155, 45, 75, 32, rngMax == 2 ? COLOR_ACCENT : COLOR_CARD_BG, "FLIP", COLOR_TEXT, 1);
+  drawModernButton(235, 45, 70, 32, rngMax == 100 ? COLOR_ACCENT : COLOR_CARD_BG, "1-100", COLOR_TEXT, 1);
+
+  gfx->fillRoundRect(15, 85, 290, 85, 8, COLOR_CARD_BG);
+  gfx->drawRoundRect(15, 85, 290, 85, 8, COLOR_TEXT_DIM);
+
+  if (lastRngResult == 0) {
+    gfx->setCursor(80, 115); gfx->setTextColor(COLOR_TEXT_DIM); gfx->setTextSize(2); gfx->print("TAP ROLL");
+  } else if (rngMax == 2) {
+    gfx->setCursor(90, 110); gfx->setTextColor(COLOR_GREEN); gfx->setTextSize(3);
+    gfx->print(lastRngResult == 1 ? "HEADS" : "TAILS");
+  } else {
+    gfx->setCursor(130, 108); gfx->setTextColor(COLOR_GREEN); gfx->setTextSize(4);
+    gfx->print(lastRngResult);
+  }
+
+  drawModernButton(15, 180, 290, 48, COLOR_GREEN, "ROLL NOW", COLOR_TEXT, 2);
+}
+
+void rollDiceRNG() {
+  lastRngResult = random(rngMin, rngMax + 1);
+  for (int i = 0; i < 3; i++) { playTone(800 + i * 200, 30); delay(40); }
+  drawDiceRNGUI();
+}
+
+// --- TIMER & STOPWATCH APP ---
+void renderTimerText() {
+  if (currentMode != 2) return;
+  if (timerSubTab == 0) {
+    int minutes = totalSeconds / 60, seconds = totalSeconds % 60;
+    String timeStr = (minutes < 10 ? "0" : "") + String(minutes) + ":" + (seconds < 10 ? "0" : "") + String(seconds);
+    drawModernButton(20, 45, 280, 42, COLOR_CARD_BG, timeStr, COLOR_TEXT, 3);
+  } else {
+    unsigned long msec = swElapsed % 1000 / 10;
+    unsigned long sec = (swElapsed / 1000) % 60;
+    unsigned long min = (swElapsed / 60000);
+    String swStr = (min < 10 ? "0" : "") + String(min) + ":" + (sec < 10 ? "0" : "") + String(sec) + "." + (msec < 10 ? "0" : "") + String(msec);
+    drawModernButton(20, 45, 280, 42, COLOR_CARD_BG, swStr, COLOR_TEXT, 3);
+  }
+}
+
+void drawTimerUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton(); drawBackButton();
+
+  drawModernButton(52, 6, 100, 28, timerSubTab == 0 ? COLOR_ACCENT : COLOR_CARD_BG, "Timer", COLOR_TEXT, 1);
+  drawModernButton(158, 6, 100, 28, timerSubTab == 1 ? COLOR_ACCENT : COLOR_CARD_BG, "Stopwatch", COLOR_TEXT, 1);
+
+  renderTimerText();
+
+  if (timerSubTab == 0) {
+    int p1[4] = {1, 5, 10, 15}; for (int i = 0; i < 4; i++) drawModernButton(12 + i * 75, 95, 70, 34, COLOR_CARD_BG, String(p1[i]) + "m", COLOR_TEXT_DIM, 1);
+    int p2[3] = {25, 30, 60}; for (int i = 0; i < 3; i++) drawModernButton(12 + i * 75, 135, 70, 34, COLOR_CARD_BG, String(p2[i]) + "m", COLOR_TEXT_DIM, 1);
+    drawModernButton(237, 95, 70, 34, COLOR_CARD_BG, "-1m", COLOR_TEXT, 1);
+    drawModernButton(237, 135, 70, 34, COLOR_CARD_BG, "+1m", COLOR_TEXT, 1);
+    drawModernButton(20, 180, 130, 48, timerRunning ? COLOR_RED : COLOR_GREEN, timerRunning ? "PAUSE" : "START", COLOR_TEXT, 2);
+    drawModernButton(170, 180, 130, 48, COLOR_CARD_BG, "RESET", COLOR_TEXT_DIM, 2);
+  } else {
+    gfx->fillRoundRect(20, 95, 280, 75, 6, COLOR_CARD_BG);
+    gfx->drawRoundRect(20, 95, 280, 75, 6, COLOR_TEXT_DIM);
+    for (int i = 0; i < 3; i++) {
+      gfx->setCursor(30, 102 + (i * 22)); gfx->setTextSize(1); gfx->setTextColor(COLOR_TEXT_DIM);
+      gfx->print("Lap "); gfx->print(i + 1); gfx->print(": ");
+      if (swLaps[i] > 0) {
+        unsigned long sec = (swLaps[i] / 1000) % 60;
+        unsigned long min = (swLaps[i] / 60000);
+        gfx->print(min); gfx->print("m "); gfx->print(sec); gfx->print("s");
+      } else { gfx->print("--"); }
+    }
+    drawModernButton(15, 180, 90, 48, swRunning ? COLOR_RED : COLOR_GREEN, swRunning ? "STOP" : "START", COLOR_TEXT, 1);
+    drawModernButton(115, 180, 90, 48, COLOR_ACCENT, "LAP", COLOR_TEXT, 1);
+    drawModernButton(215, 180, 90, 48, COLOR_CARD_BG, "RESET", COLOR_TEXT_DIM, 1);
+  }
+}
+
+void drawWeatherUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton(); drawBackButton();
+  gfx->setCursor(52, 12); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print("WEATHER");
+
+  gfx->fillRoundRect(15, 48, 290, 115, 8, COLOR_CARD_BG);
+  gfx->drawRoundRect(15, 48, 290, 115, 8, COLOR_GREEN);
+
+  gfx->setCursor(25, 60); gfx->setTextColor(COLOR_ORANGE); gfx->setTextSize(2);
+  gfx->print("Outdoor Temp:");
+
+  gfx->setCursor(25, 90); gfx->setTextColor(COLOR_GREEN); gfx->setTextSize(3);
+  if (outdoorTempC != 0.0) {
+    gfx->print(outdoorTempC, 1); gfx->print(" C / ");
+    gfx->print((outdoorTempC * 9.0 / 5.0) + 32.0, 1); gfx->print(" F");
+  } else {
+    gfx->setTextSize(2); gfx->setTextColor(COLOR_TEXT_DIM);
+    gfx->print(WiFi.status() == WL_CONNECTED ? "Ready" : "Offline");
+  }
+
+  gfx->setCursor(25, 130); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(1);
+  gfx->print("Status: "); gfx->print(weatherCondition);
+
+  drawModernButton(20, 175, 280, 48, COLOR_ACCENT, "STATUS", COLOR_TEXT, 2);
+}
+
+void drawStorageManagerUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton(); drawBackButton();
+
+  drawModernButton(52, 6, 100, 28, storageSubTab == 0 ? COLOR_ACCENT : COLOR_CARD_BG, "EEPROM", COLOR_TEXT, 1);
+  drawModernButton(158, 6, 100, 28, storageSubTab == 1 ? COLOR_ACCENT : COLOR_CARD_BG, "Telemetry", COLOR_TEXT, 1);
+
+  if (storageSubTab == 0) {
+    gfx->fillRoundRect(15, 48, 290, 115, 8, COLOR_CARD_BG);
+    gfx->drawRoundRect(15, 48, 290, 115, 8, COLOR_TEXT_DIM);
+
+    gfx->setCursor(25, 60); gfx->setTextColor(COLOR_GREEN); gfx->setTextSize(2);
+    gfx->print("Free RAM: "); gfx->print(getFreeRam()); gfx->print(" B");
+
+    gfx->setCursor(25, 90); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(1);
+    gfx->print("EEPROM Allocations:");
+    gfx->setCursor(25, 105); gfx->setTextColor(COLOR_TEXT_DIM);
+    gfx->print("Theme: 0 | PIN: 98-108");
+    gfx->setCursor(25, 120);
+    gfx->print("Grid: 110-127 | Notes: 128-229");
+    gfx->setCursor(25, 135);
+    gfx->print("Vol/Bright: 230-231");
+
+    drawModernButton(15, 175, 138, 48, COLOR_ORANGE, "RESET GRID", COLOR_TEXT, 1);
+    drawModernButton(167, 175, 138, 48, COLOR_RED, "CLEAR EEPROM", COLOR_TEXT, 1);
+  } else {
+    gfx->fillRoundRect(15, 48, 290, 175, 8, COLOR_CARD_BG);
+    gfx->drawRoundRect(15, 48, 290, 175, 8, COLOR_GREEN);
+
+    gfx->setCursor(25, 60); gfx->setTextColor(COLOR_GREEN); gfx->setTextSize(2); gfx->print("SYSTEM MONITOR");
+
+    gfx->setCursor(25, 92); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(1);
+    gfx->print("CPU Uptime: "); gfx->print(millis() / 1000); gfx->print(" seconds");
+
+    gfx->setCursor(25, 112); gfx->print("Dynamic Free RAM: "); gfx->print(getFreeRam()); gfx->print(" Bytes");
+
+    gfx->setCursor(25, 132); gfx->print("MCU Voltage: ~5.00V Operational");
+
+    gfx->setCursor(25, 152); gfx->print("Network: ");
+    gfx->print(WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "Disconnected");
+
+    gfx->setCursor(25, 172); gfx->print("Local IP: ");
+    gfx->print(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "0.0.0.0");
+  }
+}
+
+void drawSlidersUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton(); drawBackButton();
+
+  gfx->setCursor(52, 12); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print("AUDIO & DISPLAY");
+
+  gfx->setCursor(20, 52); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print("VOL: "); gfx->print(systemVolume); gfx->print("%");
+  gfx->fillRoundRect(20, 80, 280, 24, 4, COLOR_CARD_BG);
+  int volFill = (280 * systemVolume) / 100;
+  gfx->fillRoundRect(20, 80, volFill > 6 ? volFill : 6, 24, 4, COLOR_GREEN);
+  gfx->drawRoundRect(20, 80, 280, 24, 4, COLOR_TEXT_DIM);
+
+  int brightPct = map(screenBrightness, 0, 255, 0, 100);
+  gfx->setCursor(20, 125); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print("BRIGHT: "); gfx->print(brightPct); gfx->print("%");
+  gfx->fillRoundRect(20, 153, 280, 24, 4, COLOR_CARD_BG);
+  int brightFill = (280 * brightPct) / 100;
+  gfx->fillRoundRect(20, 153, brightFill > 6 ? brightFill : 6, 24, 4, COLOR_ORANGE);
+  gfx->drawRoundRect(20, 153, 280, 24, 4, COLOR_TEXT_DIM);
+
+  drawModernButton(20, 192, 135, 38, COLOR_CARD_BG, "TEST BEEP", COLOR_TEXT, 1);
+  drawModernButton(165, 192, 135, 38, COLOR_ACCENT, "SAVE SETTINGS", COLOR_TEXT, 1);
+}
+
+void drawConverterUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton(); drawBackButton();
+
+  gfx->setCursor(52, 12); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print("CONVERTER");
+
+  gfx->fillRoundRect(15, 45, 290, 75, 8, COLOR_CARD_BG);
+  gfx->drawRoundRect(15, 45, 290, 75, 8, COLOR_ORANGE);
+
+  gfx->setCursor(25, 55); gfx->setTextColor(COLOR_TEXT_DIM); gfx->setTextSize(1);
+  if (convertMode == 0) gfx->print("USD to EUR (Rate: 0.92)");
+  else if (convertMode == 1) gfx->print("USD to GBP (Rate: 0.79)");
+  else if (convertMode == 2) gfx->print("Celsius to Fahrenheit");
+
+  gfx->setCursor(25, 75); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2);
+  gfx->print(convertVal, 1);
+
+  gfx->setCursor(160, 75); gfx->setTextColor(COLOR_GREEN);
+  if (convertMode == 0) { gfx->print("= "); gfx->print(convertVal * 0.92, 2); gfx->print(" EUR"); }
+  else if (convertMode == 1) { gfx->print("= "); gfx->print(convertVal * 0.79, 2); gfx->print(" GBP"); }
+  else if (convertMode == 2) { gfx->print("= "); gfx->print((convertVal * 9.0/5.0) + 32.0, 1); gfx->print(" F"); }
+
+  drawModernButton(15, 130, 85, 42, COLOR_CARD_BG, "-10", COLOR_TEXT, 2);
+  drawModernButton(117, 130, 85, 42, COLOR_CARD_BG, "+10", COLOR_TEXT, 2);
+  drawModernButton(220, 130, 85, 42, COLOR_CARD_BG, "+50", COLOR_TEXT, 2);
+  drawModernButton(15, 182, 290, 45, COLOR_ACCENT, "SWITCH MODE", COLOR_TEXT, 2);
+}
+
+void drawSoundBoardUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton(); drawBackButton();
+
+  gfx->setCursor(52, 12); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print("SOUND BOARD");
+
+  String btnLabels[6] = {"COIN", "JUMP", "LASER", "POWER", "ALARM", "WIN!"};
+  uint16_t btnColors[6] = {COLOR_GREEN, COLOR_ACCENT, COLOR_RED, COLOR_ORANGE, COLOR_CARD_BG, COLOR_YELLOW};
+
+  int slotX[6] = {15, 117, 220, 15, 117, 220};
+  int slotY[6] = {48, 48, 48, 138, 138, 138};
+
+  for (int i = 0; i < 6; i++) {
+    drawModernButton(slotX[i], slotY[i], 85, 75, btnColors[i], btnLabels[i], (i == 5) ? COLOR_CARD_BG : COLOR_TEXT, 2);
+  }
+}
+
+void triggerSoundEffect(int idx) {
+  switch (idx) {
+    case 0: playTone(987, 80); delay(80); playTone(1318, 250); break;
+    case 1: for (int f = 150; f < 800; f += 40) playTone(f, 10); break;
+    case 2: for (int f = 1000; f > 200; f -= 50) playTone(f, 8); break;
+    case 3: playTone(400, 100); playTone(600, 100); playTone(800, 150); break;
+    case 4: for (int i = 0; i < 3; i++) { playTone(1500, 100); delay(50); playTone(800, 100); delay(50); } break;
+    case 5: playTone(523, 100); playTone(659, 100); playTone(784, 100); playTone(1046, 300); break;
+  }
+}
+
+void updatePasscodeDots() {
+  gfx->fillRoundRect(60, 42, 200, 32, 6, COLOR_CARD_BG);
+  gfx->drawRoundRect(60, 42, 200, 32, 6, COLOR_TEXT_DIM);
+  String maskedStr = ""; for (int i = 0; i < pinEntryInput.length(); i++) maskedStr += "* ";
+  gfx->setCursor(100, 50); gfx->setTextSize(2); gfx->setTextColor(COLOR_TEXT); gfx->print(maskedStr);
+}
+
+void drawPasscodePadUI(String title) {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG);
+  if (currentMode == 10 || currentMode == 11 || currentMode == 12) drawBackButton();
+  int titleX = (320 - (title.length() * 12)) / 2;
+  gfx->setCursor(titleX > 10 ? titleX : 10, 12); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print(title);
+  updatePasscodeDots();
+  const char padKeys[4][3] = {{'1','2','3'},{'4','5','6'},{'7','8','9'},{'C','0','E'}};
+  for (int row = 0; row < 4; row++) {
+    for (int col = 0; col < 3; col++) {
+      char key = padKeys[row][col];
+      uint16_t btnColor = (key == 'E') ? COLOR_GREEN : ((key == 'C') ? COLOR_RED : COLOR_CARD_BG);
+      drawModernButton(65 + col * 65, 84 + row * 38, 55, 34, btnColor, (key == 'E') ? "OK" : String(key), COLOR_TEXT, 2);
+    }
+  }
+}
+
+void drawNotesUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton(); drawBackButton();
+  gfx->setCursor(52, 12); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print("NOTES & MEMO");
+  gfx->fillRoundRect(15, 48, 290, 110, 6, COLOR_CARD_BG); gfx->drawRoundRect(15, 48, 290, 110, 6, COLOR_TEXT_DIM);
+  gfx->setCursor(25, 60); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print(userNote.length() > 0 ? userNote : "Empty Note");
+  drawModernButton(15, 172, 138, 48, COLOR_ACCENT, "EDIT NOTE", COLOR_TEXT, 2);
+  drawModernButton(167, 172, 138, 48, COLOR_RED, "CLEAR", COLOR_TEXT, 2);
+}
+
+void drawCryptoUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton(); drawBackButton();
+  gfx->setCursor(52, 12); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print("CRYPTO TRACKER");
+  gfx->fillRoundRect(15, 48, 290, 110, 6, COLOR_CARD_BG); gfx->drawRoundRect(15, 48, 290, 110, 6, COLOR_ORANGE);
+  gfx->setCursor(30, 65); gfx->setTextColor(COLOR_ORANGE); gfx->setTextSize(2); gfx->print("Bitcoin (BTC)");
+  gfx->setCursor(30, 105); gfx->setTextColor(COLOR_GREEN); gfx->setTextSize(3);
+  if (btcPriceUSD > 0) { gfx->print("$"); gfx->print(btcPriceUSD, 0); }
+  else { gfx->setTextSize(2); gfx->setTextColor(COLOR_TEXT_DIM); gfx->print(WiFi.status() == WL_CONNECTED ? "Ready" : "Offline"); }
+  drawModernButton(20, 172, 280, 48, COLOR_ACCENT, "STATUS", COLOR_TEXT, 2);
+}
+
+void drawWidgetCustomizeUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton(); drawBackButton();
+  drawModernButton(50, 6, 30, 30, homePage == 0 ? COLOR_CARD_BG : COLOR_ACCENT, "<", COLOR_TEXT, 2);
+  gfx->setCursor(85, 12); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print("P" + String(homePage + 1));
+  drawModernButton(112, 6, 30, 30, homePage == 2 ? COLOR_CARD_BG : COLOR_ACCENT, ">", COLOR_TEXT, 2);
+
+  int slotX[6] = {15, 117, 220, 15, 117, 220};
+  int slotY[6] = {48, 48, 48, 134, 134, 134};
+  int offset = homePage * 6;
+
+  for (int i = 0; i < 6; i++) {
+    int layoutIdx = offset + i;
+    String name; uint16_t btnColor, textColor;
+    getWidgetDetails(homeLayout[layoutIdx], name, btnColor, textColor);
+    if (selectedSwapSlot == layoutIdx) btnColor = COLOR_YELLOW;
+    drawModernButton(slotX[i], slotY[i], 85, 75, btnColor, name, selectedSwapSlot == layoutIdx ? COLOR_CARD_BG : textColor, 2);
+    drawAppIcon(slotX[i], slotY[i], homeLayout[layoutIdx], textColor);
+  }
+}
+
+void drawGamesMenuUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton(); drawBackButton();
+  gfx->setCursor(70, 12); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print("GAMES MENU");
+  drawModernButton(20, 60, 280, 60, COLOR_CARD_BG, "Tic-Tac-Toe", COLOR_TEXT, 2);
+  drawModernButton(20, 140, 280, 60, COLOR_ACCENT, "Dino Jump", COLOR_TEXT, 2);
+}
+
+void resetTTTGame() {
+  for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) tttBoard[r][c] = ' ';
+  tttGameOver = false; tttStatus = "YOUR TURN (X)";
+}
+
+bool checkTTTWinner(char p) {
+  for (int i = 0; i < 3; i++) {
+    if (tttBoard[i][0] == p && tttBoard[i][1] == p && tttBoard[i][2] == p) return true;
+    if (tttBoard[0][i] == p && tttBoard[1][i] == p && tttBoard[2][i] == p) return true;
+  }
+  if (tttBoard[0][0] == p && tttBoard[1][1] == p && tttBoard[2][2] == p) return true;
+  if (tttBoard[0][2] == p && tttBoard[1][1] == p && tttBoard[2][0] == p) return true;
+  return false;
+}
+
+bool isTTTFull() {
+  for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) if (tttBoard[r][c] == ' ') return false;
+  return true;
+}
+
+void tttAIMove() {
+  if (tttGameOver) return;
+  for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) { if (tttBoard[r][c] == ' ') { tttBoard[r][c] = 'O'; if (checkTTTWinner('O')) return; tttBoard[r][c] = ' '; } }
+  for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) { if (tttBoard[r][c] == ' ') { tttBoard[r][c] = 'X'; if (checkTTTWinner('X')) { tttBoard[r][c] = 'O'; return; } tttBoard[r][c] = ' '; } }
+  if (tttBoard[1][1] == ' ') { tttBoard[1][1] = 'O'; return; }
+  for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) if (tttBoard[r][c] == ' ') { tttBoard[r][c] = 'O'; return; }
+}
+
+void drawTTTUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton(); drawBackButton();
+  gfx->setCursor(52, 12); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print("TIC-TAC-TOE");
+  for (int i = 1; i < 3; i++) {
+    gfx->fillRect(35 + i * 55, 48, 4, 165, COLOR_TEXT_DIM);
+    gfx->fillRect(35, 48 + i * 55, 169, 4, COLOR_TEXT_DIM);
+  }
+  for (int r = 0; r < 3; r++) {
+    for (int c = 0; c < 3; c++) {
+      if (tttBoard[r][c] == 'X') { gfx->setCursor(45 + c * 55, 58 + r * 55); gfx->setTextColor(COLOR_GREEN); gfx->setTextSize(4); gfx->print("X"); }
+      else if (tttBoard[r][c] == 'O') { gfx->setCursor(45 + c * 55, 58 + r * 55); gfx->setTextColor(COLOR_RED); gfx->setTextSize(4); gfx->print("O"); }
+    }
+  }
+  gfx->setCursor(215, 55); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(1); gfx->print("SCORE:");
+  gfx->setCursor(215, 75); gfx->setTextColor(COLOR_GREEN); gfx->setTextSize(2); gfx->print("YOU: " + String(tttScoreX));
+  gfx->setCursor(215, 100); gfx->setTextColor(COLOR_RED); gfx->setTextSize(2); gfx->print("CPU: " + String(tttScoreO));
+  gfx->setCursor(215, 135); gfx->setTextColor(COLOR_ORANGE); gfx->setTextSize(1); gfx->print(tttStatus);
+  drawModernButton(215, 175, 95, 38, COLOR_CARD_BG, "RESET", COLOR_TEXT, 1);
+}
+
+void resetDinoGame() { dinoY = 160; dinoVelocity = 0; isJumping = false; cactusX = 320; dinoScore = 0; dinoGameOver = false; }
+
+void drawDinoUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton();
+  gfx->drawFastHLine(0, 190, 320, COLOR_TEXT_DIM);
+  gfx->setCursor(10, 10); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print("SCORE: "); gfx->print(dinoScore);
+  gfx->setCursor(180, 10); gfx->setTextColor(COLOR_ACCENT); gfx->print("HI: "); gfx->print(dinoHighScore);
+
+  if (dinoGameOver) {
+    gfx->setCursor(60, 90); gfx->setTextColor(COLOR_RED); gfx->setTextSize(3); gfx->print("GAME OVER!");
+    drawModernButton(80, 130, 160, 42, COLOR_GREEN, "RESTART", COLOR_TEXT, 2); return;
+  }
+  gfx->fillRect(40, dinoY - 25, 20, 25, COLOR_GREEN); gfx->fillRect(52, dinoY - 25, 10, 10, COLOR_GREEN);
+  gfx->fillRect(cactusX, 160, 12, 30, COLOR_RED); gfx->fillRect(cactusX - 4, 168, 4, 10, COLOR_RED); gfx->fillRect(cactusX + 12, 168, 4, 10, COLOR_RED);
+}
+
+void updateDinoPhysics() {
+  if (currentMode != 16 || dinoGameOver) return;
+  unsigned long now = millis();
+  if (now - lastDinoFrame < 30) return;
+  lastDinoFrame = now;
+
+  if (isJumping) {
+    dinoY += dinoVelocity; dinoVelocity += 2;
+    if (dinoY >= 160) { dinoY = 160; isJumping = false; dinoVelocity = 0; }
+  }
+  cactusX -= 7;
+  if (cactusX < -15) { cactusX = 320; dinoScore += 10; playTone(1200, 20); if (dinoScore > dinoHighScore) dinoHighScore = dinoScore; }
+  if (cactusX >= 30 && cactusX <= 60 && dinoY >= 140) { dinoGameOver = true; playTone(300, 400); }
+  drawDinoUI();
+}
+
+void drawDiscordUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton(); drawBackButton();
+  gfx->setCursor(52, 12); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print("DISCORD ALERTS");
+  gfx->fillRoundRect(20, 42, 280, 34, 6, COLOR_CARD_BG); gfx->drawRoundRect(20, 42, 280, 34, 6, COLOR_TEXT_DIM);
+  gfx->setCursor(28, 50); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(1);
+  gfx->print(customDiscordText.length() > 0 ? customDiscordText : "Tap 'Type' to enter text...");
+
+  drawModernButton(20, 84, 280, 34, COLOR_ACCENT, "TYPE MESSAGE", COLOR_TEXT, 1);
+  drawModernButton(20, 124, 280, 34, COLOR_GREEN, "SEND CUSTOM MESSAGE", COLOR_TEXT, 1);
+  drawModernButton(20, 164, 135, 34, COLOR_CARD_BG, "Studying - Busy", COLOR_TEXT, 1);
+  drawModernButton(165, 164, 135, 34, COLOR_ORANGE, "Timer Alert", COLOR_TEXT, 1);
+}
+
+void updateCalcDisplay(String text) {
+  gfx->fillRoundRect(12, 10, 250, 38, 6, COLOR_CARD_BG);
+  gfx->setCursor(22, 20); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print(text);
+}
+
+void drawCalculatorUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton();
+  updateCalcDisplay(calcInput.length() > 0 ? calcInput : "0");
+  char keys[4][4] = {{'7','8','9','/'},{'4','5','6','*'},{'1','2','3','-'},{'C','0','=','+'}};
+  for (int row = 0; row < 4; row++) {
+    for (int col = 0; col < 4; col++) {
+      uint16_t btnColor = (col == 3) ? COLOR_ORANGE : (keys[row][col] == 'C' ? COLOR_RED : COLOR_CARD_BG);
+      drawModernButton(12 + col * 75, 56 + row * 44, 70, 38, btnColor, String(keys[row][col]), COLOR_TEXT, 2);
+    }
+  }
+}
+
+void calculateResult() {
+  num2 = calcInput.toFloat(); float result = 0;
+  if (op == '+') result = num1 + num2; else if (op == '-') result = num1 - num2;
+  else if (op == '*') result = num1 * num2; else if (op == '/') result = (num2 != 0) ? num1 / num2 : 0;
+  calcInput = String(result); if (calcInput.endsWith(".00")) calcInput.remove(calcInput.length() - 3);
+  updateCalcDisplay(calcInput); op = ' ';
+}
+
+void clearCanvas() { gfx->fillRect(0, 42, 320, 198, COLOR_BG); }
+
+void drawColorPaletteBar() {
+  gfx->fillRect(0, 0, 268, 40, COLOR_BG);
+  uint16_t colors[4] = {COLOR_RED, COLOR_GREEN, COLOR_BLUE, COLOR_TEXT};
+  for (int i = 0; i < 4; i++) {
+    int x = 6 + i * 32; gfx->fillRoundRect(x, 6, 26, 28, 4, colors[i]);
+    if (currentColor == colors[i]) gfx->drawRoundRect(x - 2, 4, 30, 32, 4, COLOR_TEXT);
+  }
+  drawModernButton(140, 6, 38, 28, (brushSize == 1) ? COLOR_ACCENT : COLOR_CARD_BG, "THIN", COLOR_TEXT, 1);
+  drawModernButton(182, 6, 42, 28, (brushSize == 4) ? COLOR_ACCENT : COLOR_CARD_BG, "THICK", COLOR_TEXT, 1);
+  drawModernButton(228, 6, 38, 28, COLOR_CARD_BG, "CLR", COLOR_TEXT_DIM, 1);
+}
+
+void drawDrawingUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton(); drawColorPaletteBar(); clearCanvas();
+}
+
+void drawSettingsUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton();
+  gfx->setCursor(20, 12); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print("SETTINGS");
+  drawModernButton(20, 42, 135, 36, COLOR_ACCENT, "Themes", COLOR_TEXT, 2);
+  drawModernButton(165, 42, 135, 36, COLOR_GREEN, "Storage", COLOR_TEXT, 2);
+  drawModernButton(20, 86, 280, 36, COLOR_CARD_BG, "Network Info", COLOR_TEXT, 2);
+  drawModernButton(20, 130, 280, 36, COLOR_ORANGE, "Arrange Widgets", COLOR_TEXT, 2);
+  drawModernButton(20, 174, 85, 36, COLOR_CARD_BG, "PIN", COLOR_TEXT, 2);
+  drawModernButton(112, 174, 90, 36, COLOR_ORANGE, "Lock", COLOR_TEXT, 2);
+  drawModernButton(209, 174, 91, 36, COLOR_RED, "Reboot", COLOR_TEXT, 2);
+}
+
+void drawThemeMenuUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton(); drawBackButton();
+  gfx->setCursor(52, 12); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(2); gfx->print("SELECT THEME");
+  drawModernButton(15, 48, 138, 54, (currentTheme == 0) ? COLOR_ACCENT : COLOR_CARD_BG, "Dark Slate", COLOR_TEXT, 1);
+  drawModernButton(165, 48, 138, 54, (currentTheme == 1) ? COLOR_ACCENT : COLOR_CARD_BG, "Light Blue", COLOR_TEXT, 1);
+  drawModernButton(15, 110, 138, 54, (currentTheme == 2) ? COLOR_ACCENT : COLOR_CARD_BG, "Crimson Red", COLOR_TEXT, 1);
+  drawModernButton(165, 110, 138, 54, (currentTheme == 3) ? COLOR_ACCENT : COLOR_CARD_BG, "Amber Orange", COLOR_TEXT, 1);
+  drawModernButton(15, 172, 138, 54, (currentTheme == 4) ? COLOR_ACCENT : COLOR_CARD_BG, "Emerald Green", COLOR_TEXT, 1);
+  drawModernButton(165, 172, 138, 54, (currentTheme == 5) ? COLOR_ACCENT : COLOR_CARD_BG, "Royal Purple", COLOR_TEXT, 1);
+}
+
+void drawKeyboardUI() {
+  gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawHomeButton(); drawBackButton();
+  gfx->fillRoundRect(50, 6, 215, 28, 4, COLOR_CARD_BG); gfx->drawRoundRect(50, 6, 215, 28, 4, COLOR_TEXT_DIM);
+  gfx->setCursor(56, 12); gfx->setTextColor(COLOR_TEXT); gfx->setTextSize(1); gfx->print(enteredPassword);
+
+  const char* r1 = "1234567890"; const char* r2 = "qwertyuiop"; const char* r3 = "asdfghjkl"; const char* r4 = "zxcvbnm";
+  for (int i = 0; i < 10; i++) drawModernButton(6 + i * 31, 40, 28, 28, COLOR_CARD_BG, String(r1[i]), COLOR_TEXT, 1);
+  for (int i = 0; i < 10; i++) drawModernButton(6 + i * 31, 72, 28, 28, COLOR_CARD_BG, String(r2[i]), COLOR_TEXT, 1);
+  for (int i = 0; i < 9; i++) drawModernButton(21 + i * 31, 104, 28, 28, COLOR_CARD_BG, String(r3[i]), COLOR_TEXT, 1);
+  for (int i = 0; i < 7; i++) drawModernButton(52 + i * 31, 136, 28, 28, COLOR_CARD_BG, String(r4[i]), COLOR_TEXT, 1);
+  drawModernButton(6, 136, 42, 28, COLOR_CARD_BG, ".", COLOR_TEXT, 2);
+  drawModernButton(269, 136, 45, 28, COLOR_CARD_BG, "SPC", COLOR_TEXT, 1);
+  drawModernButton(6, 172, 80, 32, COLOR_RED, "DEL", COLOR_TEXT, 1);
+  drawModernButton(92, 172, 80, 32, COLOR_ORANGE, "CLR", COLOR_TEXT, 1);
+  drawModernButton(178, 172, 136, 32, COLOR_GREEN, "DONE", COLOR_TEXT, 1);
+}
+
+void lockSystem() { isLocked = true; currentMode = 9; gfx->fillRect(0, 0, 320, 240, COLOR_BG); drawModernButton(60, 160, 200, 50, COLOR_ACCENT, "LOGIN", COLOR_TEXT, 2); }
+
+void launchAppById(int appId) {
+  if (appId == 0) return;
+  currentMode = appId;
+  if (appId == 1) drawCalculatorUI();
+  else if (appId == 2) drawTimerUI();
+  else if (appId == 3) drawDrawingUI();
+  else if (appId == 17) drawDiscordUI();
+  else if (appId == 18) drawNotesUI();
+  else if (appId == 20) drawCryptoUI();
+  else if (appId == 21) drawWeatherUI();
+  else if (appId == 14) drawGamesMenuUI();
+  else if (appId == 4) drawSettingsUI();
+  else if (appId == 22) drawStorageManagerUI();
+  else if (appId == 23) drawSlidersUI();
+  else if (appId == 24) drawConverterUI();
+  else if (appId == 25) drawSoundBoardUI();
+  else if (appId == 26) drawFlashlightUI();
+  else if (appId == 27) drawDiceRNGUI();
+}
+
+// --- SETUP & MAIN LOOP ---
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(TFT_BACKLIGHT_PIN, OUTPUT);
+  analogWrite(TFT_BACKLIGHT_PIN, screenBrightness);
+
+  Modulino.begin(Wire1);
+  buzzer.begin();
+
+  uint8_t savedVol = EEPROM.read(EEPROM_VOL_ADDR);
+  if (savedVol <= 100) systemVolume = savedVol;
+
+  uint8_t savedBright = EEPROM.read(EEPROM_BRIGHT_ADDR);
+  if (savedBright > 0) { screenBrightness = savedBright; analogWrite(TFT_BACKLIGHT_PIN, screenBrightness); }
+
+  uint8_t savedTheme = EEPROM.read(EEPROM_THEME_ADDR);
+  if (savedTheme > 5) savedTheme = 0;
+  applyTheme(savedTheme);
+
+  loadLayoutFromEEPROM();
+  loadNoteFromEEPROM();
+
+  String epin; if (loadPINFromEEPROM(epin)) savedPIN = epin;
+
+  gfx->begin();
+
+  randomSeed(analogRead(A0) + millis());
+  lastActivityTime = millis();
+  drawHomeScreen();
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // Timer Tick Physics
+  if (timerRunning && timerSubTab == 0) {
+    if (now - previousMillis >= 1000) {
+      previousMillis = now;
+      if (totalSeconds > 0) { totalSeconds--; renderTimerText(); }
+      else {
+        timerRunning = false; playTone(2000, 800);
+        if (currentMode == 2) drawTimerUI();
+      }
+    }
+  }
+
+  // Stopwatch Tick Physics
+  if (swRunning && timerSubTab == 1) {
+    swElapsed = now - swStartTime;
+    if (currentMode == 2) renderTimerText();
+  }
+
+  // SOS Strobe Physics
+  if (currentMode == 26 && flashlightMode == 3) {
+    if (now - lastSosToggle > 250) {
+      lastSosToggle = now;
+      sosState = !sosState;
+      drawFlashlightUI();
+    }
+  }
+
+  updateDinoPhysics();
+
+  TSPoint p = ts.getPoint();
+  pinMode(XM, OUTPUT); pinMode(YP, OUTPUT);
+
+  bool hasTouch = (p.z > MINPRESSURE && p.z < MAXPRESSURE) || remoteTouchPending;
+  int16_t x = 0, y = 0;
+
+  if (hasTouch) {
+    lastActivityTime = millis();
+    playTone(1000, 15);
+
+    if (remoteTouchPending) { x = remoteTouchX; y = remoteTouchY; remoteTouchPending = false; }
+    else { x = map(p.y, TS_MINY, TS_MAXX, 0, gfx->width()); y = map(p.x, TS_MINX, TS_MAXY, 0, gfx->height()); }
+
+    // UNIVERSAL HOME BUTTON CHECK
+    if (currentMode != 0 && currentMode != 9 && currentMode != 10 && currentMode != 13 && currentMode != 26 && x >= 268 && y <= 38) {
+      currentMode = 0; drawHomeScreen(); delay(200); return;
+    }
+
+    // UNIVERSAL BACK BUTTON CHECK
+    if (x <= 48 && y <= 38 && currentMode != 26) {
+      if (currentMode == 5 || currentMode == 6 || currentMode == 11 || currentMode == 12 || currentMode == 19 || currentMode == 22) {
+        currentMode = 4; drawSettingsUI(); delay(200); return;
+      } else if (currentMode == 8) {
+        if (keyboardReturnMode == 17) { currentMode = 17; drawDiscordUI(); }
+        else if (keyboardReturnMode == 18) { currentMode = 18; drawNotesUI(); }
+        delay(200); return;
+      } else if (currentMode == 15 || currentMode == 16) {
+        currentMode = 14; drawGamesMenuUI(); delay(200); return;
+      } else if (currentMode != 0 && currentMode != 9 && currentMode != 10 && currentMode != 13) {
+        currentMode = 0; drawHomeScreen(); delay(200); return;
+      }
+    }
+
+    // Dynamic Touch Routing
+    if (currentMode == 0) {
+      if (x >= 200 && y <= 42) { currentMode = 6; drawWiFiStatusUI(); delay(200); return; }
+
+      if (y >= 12 && y <= 42) {
+        if (x >= 108 && x <= 138 && homePage > 0) { homePage--; drawHomeScreen(); delay(200); return; }
+        else if (x >= 165 && x <= 195 && homePage < 2) { homePage++; drawHomeScreen(); delay(200); return; }
+      }
+
+      int clickedSlot = -1;
+      if (y >= 54 && y <= 129) {
+        if (x >= 15 && x <= 100) clickedSlot = 0; else if (x >= 117 && x <= 202) clickedSlot = 1; else if (x >= 220 && x <= 305) clickedSlot = 2;
+      } else if (y >= 142 && y <= 217) {
+        if (x >= 15 && x <= 100) clickedSlot = 3; else if (x >= 117 && x <= 202) clickedSlot = 4; else if (x >= 220 && x <= 305) clickedSlot = 5;
+      }
+
+      if (clickedSlot != -1) {
+        int layoutIdx = (homePage * 6) + clickedSlot;
+        launchAppById(homeLayout[layoutIdx]);
+        delay(200);
+      }
+    }
+    else if (currentMode == 1) { // Calc
+      if (y >= 56 && y <= 232) {
+        int col = (x - 12) / 75, row = (y - 56) / 44;
+        if (col >= 0 && col < 4 && row >= 0 && row < 4) {
+          char keys[4][4] = {{'7','8','9','/'},{'4','5','6','*'},{'1','2','3','-'},{'C','0','=','+'}};
+          char pressed = keys[row][col];
+          if (pressed >= '0' && pressed <= '9') { if (calcInput == "0") calcInput = ""; calcInput += pressed; updateCalcDisplay(calcInput); }
+          else if (pressed == 'C') { calcInput = ""; num1 = 0; num2 = 0; op = ' '; updateCalcDisplay("0"); }
+          else if (pressed == '=') { if (op != ' ' && calcInput.length() > 0) calculateResult(); }
+          else { if (calcInput.length() > 0) { num1 = calcInput.toFloat(); op = pressed; calcInput = ""; updateCalcDisplay(String(num1) + " " + op); } }
+          delay(200);
+        }
+      }
+    }
+    else if (currentMode == 2) { // Timer & Stopwatch
+      if (y >= 6 && y <= 34) {
+        if (x >= 52 && x <= 152) { timerSubTab = 0; drawTimerUI(); delay(150); return; }
+        else if (x >= 158 && x <= 258) { timerSubTab = 1; drawTimerUI(); delay(150); return; }
+      }
+      if (timerSubTab == 0) {
+        if (y >= 95 && y <= 129) {
+          int col = (x - 12) / 75, p1[4] = {1, 5, 10, 15};
+          if (col >= 0 && col < 3) { timerRunning = false; initialTimerSeconds = p1[col] * 60; totalSeconds = initialTimerSeconds; drawTimerUI(); delay(200); }
+          else if (col == 3) { if (totalSeconds >= 60) { totalSeconds -= 60; initialTimerSeconds = totalSeconds; } renderTimerText(); delay(200); }
+        } else if (y >= 135 && y <= 169) {
+          int col = (x - 12) / 75, p2[3] = {25, 30, 60};
+          if (col >= 0 && col < 3) { timerRunning = false; initialTimerSeconds = p2[col] * 60; totalSeconds = initialTimerSeconds; drawTimerUI(); delay(200); }
+          else if (col == 3) { totalSeconds += 60; initialTimerSeconds = totalSeconds; renderTimerText(); delay(200); }
+        } else if (x >= 20 && x <= 150 && y >= 180 && y <= 228) { timerRunning = !timerRunning; drawTimerUI(); delay(250); }
+        else if (x >= 170 && x <= 300 && y >= 180 && y <= 228) { timerRunning = false; totalSeconds = 25 * 60; initialTimerSeconds = totalSeconds; drawTimerUI(); delay(250); }
+      } else {
+        if (y >= 180 && y <= 228) {
+          if (x >= 15 && x <= 105) {
+            if (!swRunning) { swRunning = true; swStartTime = millis() - swElapsed; }
+            else { swRunning = false; }
+            drawTimerUI(); delay(200);
+          } else if (x >= 115 && x <= 205) {
+            if (swRunning && swLapCount < 3) { swLaps[swLapCount++] = swElapsed; drawTimerUI(); }
+            delay(200);
+          } else if (x >= 215 && x <= 305) {
+            swRunning = false; swElapsed = 0; swLapCount = 0;
+            for (int i = 0; i < 3; i++) swLaps[i] = 0;
+            drawTimerUI(); delay(200);
+          }
+        }
+      }
+    }
+    else if (currentMode == 3) { // Draw
+      if (y <= 40) {
+        uint16_t colors[4] = {COLOR_RED, COLOR_GREEN, COLOR_BLUE, COLOR_TEXT};
+        for (int i = 0; i < 4; i++) { if (x >= 6 + i * 32 && x <= 32 + i * 32) { currentColor = colors[i]; drawColorPaletteBar(); delay(150); return; } }
+        if (x >= 140 && x <= 178) { brushSize = 1; drawColorPaletteBar(); delay(150); return; }
+        if (x >= 182 && x <= 224) { brushSize = 4; drawColorPaletteBar(); delay(150); return; }
+        if (x >= 228 && x <= 266) { clearCanvas(); delay(200); }
+      } else if (y > 42) {
+        if (lastX > 0 && lastY > 42) { gfx->drawLine(lastX, lastY, x, y, currentColor); gfx->fillCircle(x, y, brushSize, currentColor); }
+        lastX = x; lastY = y;
+      }
+    }
+    else if (currentMode == 4) { // Settings
+      if (y >= 42 && y <= 78) {
+        if (x >= 20 && x <= 155) { currentMode = 5; drawThemeMenuUI(); delay(200); }
+        else if (x >= 165 && x <= 300) { currentMode = 22; drawStorageManagerUI(); delay(200); }
+      }
+      else if (x >= 20 && x <= 300 && y >= 86 && y <= 122) { currentMode = 6; drawWiFiStatusUI(); delay(200); }
+      else if (x >= 20 && x <= 300 && y >= 130 && y <= 166) { currentMode = 19; selectedSwapSlot = -1; drawWidgetCustomizeUI(); delay(200); }
+      else if (y >= 174 && y <= 210) {
+        if (x >= 20 && x <= 105) { currentMode = 11; pinEntryInput = ""; drawPasscodePadUI("NEW 4-DIGIT PIN"); delay(200); }
+        else if (x >= 112 && x <= 202) { lockSystem(); delay(200); }
+        else if (x >= 209 && x <= 300) { rebootSystem(); }
+      }
+    }
+    else if (currentMode == 5) { // Themes
+      if (y >= 48 && y <= 102) { if (x <= 153) applyTheme(0); else applyTheme(1); drawThemeMenuUI(); delay(200); }
+      else if (y >= 110 && y <= 164) { if (x <= 153) applyTheme(2); else applyTheme(3); drawThemeMenuUI(); delay(200); }
+      else if (y >= 172 && y <= 226) { if (x <= 153) applyTheme(4); else applyTheme(5); drawThemeMenuUI(); delay(200); }
+    }
+    else if (currentMode == 6) { // WiFi Info
+      if (x >= 20 && x <= 300 && y >= 184 && y <= 228) { drawWiFiStatusUI(); delay(200); }
+    }
+    else if (currentMode == 8) { // Keyboard
+      if (y >= 172 && y <= 204) { 
+        if (x >= 6 && x <= 86) { if (enteredPassword.length() > 0) enteredPassword.remove(enteredPassword.length() - 1); drawKeyboardUI(); delay(150); return; }
+        if (x >= 92 && x <= 172) { enteredPassword = ""; drawKeyboardUI(); delay(150); return; }
+        if (x >= 178 && x <= 314) {
+          if (keyboardReturnMode == 17) { customDiscordText = enteredPassword; currentMode = 17; drawDiscordUI(); }
+          else if (keyboardReturnMode == 18) { userNote = enteredPassword; saveNoteToEEPROM(userNote); currentMode = 18; drawNotesUI(); }
+          delay(200); return; 
+        }
+      }
+      if (y >= 136 && y <= 164) {
+        if (x >= 6 && x <= 48) { enteredPassword += "."; drawKeyboardUI(); delay(150); return; }
+        if (x >= 269 && x <= 314) { enteredPassword += " "; drawKeyboardUI(); delay(150); return; }
+      }
+      const char* rows[4] = {"1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"};
+      if (y >= 40 && y <= 68) { int idx = (x - 6) / 31; if (idx >= 0 && idx < 10) { enteredPassword += rows[0][idx]; drawKeyboardUI(); delay(150); } }
+      else if (y >= 72 && y <= 100) { int idx = (x - 6) / 31; if (idx >= 0 && idx < 10) { enteredPassword += rows[1][idx]; drawKeyboardUI(); delay(150); } }
+      else if (y >= 104 && y <= 132) { int idx = (x - 21) / 31; if (idx >= 0 && idx < 9) { enteredPassword += rows[2][idx]; drawKeyboardUI(); delay(150); } }
+      else if (y >= 136 && y <= 164) { int idx = (x - 52) / 31; if (idx >= 0 && idx < 7) { enteredPassword += rows[3][idx]; drawKeyboardUI(); delay(150); } }
+    }
+    else if (currentMode == 9) { // Lock Clock
+      if (x >= 60 && x <= 260 && y >= 160 && y <= 210) { pinEntryInput = ""; currentMode = 10; drawPasscodePadUI("ENTER PASSCODE"); delay(200); }
+    }
+    else if (currentMode == 10) { // Passcode Keypad
+      if (y >= 84 && y <= 236) {
+        int col = (x - 65) / 65, row = (y - 84) / 38;
+        if (col >= 0 && col < 3 && row >= 0 && row < 4) {
+          const char padKeys[4][3] = {{'1','2','3'},{'4','5','6'},{'7','8','9'},{'C','0','E'}};
+          char key = padKeys[row][col];
+          if (key >= '0' && key <= '9' && pinEntryInput.length() < 4) { pinEntryInput += key; updatePasscodeDots(); }
+          else if (key == 'C') { pinEntryInput = ""; updatePasscodeDots(); }
+          else if (key == 'E') {
+            if (pinEntryInput == savedPIN) { isLocked = false; currentMode = 0; drawHomeScreen(); }
+            else { pinEntryInput = ""; triggerWrongPasswordBuzzer(); drawPasscodePadUI("WRONG PIN!"); }
+          }
+          delay(200);
+        }
+      }
+    }
+    else if (currentMode == 11) { // Set PIN
+      if (y >= 84 && y <= 236) {
+        int col = (x - 65) / 65, row = (y - 84) / 38;
+        if (col >= 0 && col < 3 && row >= 0 && row < 4) {
+          const char padKeys[4][3] = {{'1','2','3'},{'4','5','6'},{'7','8','9'},{'C','0','E'}};
+          char key = padKeys[row][col];
+          if (key >= '0' && key <= '9' && pinEntryInput.length() < 4) { pinEntryInput += key; updatePasscodeDots(); }
+          else if (key == 'C') { pinEntryInput = ""; updatePasscodeDots(); }
+          else if (key == 'E') {
+            if (pinEntryInput.length() == 4) { tempNewPIN = pinEntryInput; pinEntryInput = ""; currentMode = 12; drawPasscodePadUI("CONFIRM NEW PIN"); }
+            else { pinEntryInput = ""; triggerWrongPasswordBuzzer(); drawPasscodePadUI("MUST BE 4 DIGITS!"); }
+          }
+          delay(200);
+        }
+      }
+    }
+    else if (currentMode == 12) { // Confirm PIN
+      if (y >= 84 && y <= 236) {
+        int col = (x - 65) / 65, row = (y - 84) / 38;
+        if (col >= 0 && col < 3 && row >= 0 && row < 4) {
+          const char padKeys[4][3] = {{'1','2','3'},{'4','5','6'},{'7','8','9'},{'C','0','E'}};
+          char key = padKeys[row][col];
+          if (key >= '0' && key <= '9' && pinEntryInput.length() < 4) { pinEntryInput += key; updatePasscodeDots(); }
+          else if (key == 'C') { pinEntryInput = ""; updatePasscodeDots(); }
+          else if (key == 'E') {
+            if (pinEntryInput == tempNewPIN) { savedPIN = tempNewPIN; savePINToEEPROM(savedPIN); currentMode = 4; drawSettingsUI(); }
+            else { pinEntryInput = ""; tempNewPIN = ""; currentMode = 11; triggerWrongPasswordBuzzer(); drawPasscodePadUI("MISMATCH! TRY AGAIN"); }
+          }
+          delay(200);
+        }
+      }
+    }
+    else if (currentMode == 14) { // Games Menu
+      if (x >= 20 && x <= 300) {
+        if (y >= 60 && y <= 120) { currentMode = 15; resetTTTGame(); drawTTTUI(); delay(200); }
+        else if (y >= 140 && y <= 200) { currentMode = 16; resetDinoGame(); drawDinoUI(); delay(200); }
+      }
+    }
+    else if (currentMode == 15) { // Tic-Tac-Toe
+      if (x >= 215 && y >= 175 && y <= 213) { resetTTTGame(); drawTTTUI(); delay(200); return; }
+      if (!tttGameOver && x >= 35 && x <= 200 && y >= 48 && y <= 213) {
+        int col = (x - 35) / 55, row = (y - 48) / 55;
+        if (col >= 0 && col < 3 && row >= 0 && row < 3 && tttBoard[row][col] == ' ') {
+          tttBoard[row][col] = 'X';
+          if (checkTTTWinner('X')) { tttGameOver = true; tttScoreX++; tttStatus = "YOU WIN!"; playTone(1500, 200); }
+          else if (isTTTFull()) { tttGameOver = true; tttStatus = "DRAW GAME!"; }
+          else {
+            tttAIMove();
+            if (checkTTTWinner('O')) { tttGameOver = true; tttScoreO++; tttStatus = "CPU WINS!"; playTone(400, 300); }
+            else if (isTTTFull()) { tttGameOver = true; tttStatus = "DRAW GAME!"; }
+          }
+          drawTTTUI(); delay(200);
+        }
+      }
+    }
+    else if (currentMode == 16) { // Dino Jump
+      if (dinoGameOver) { if (x >= 80 && x <= 240 && y >= 130 && y <= 172) { resetDinoGame(); drawDinoUI(); delay(200); } }
+      else { if (!isJumping) { isJumping = true; dinoVelocity = -14; playTone(1000, 25); } }
+    }
+    else if (currentMode == 17) { // Discord
+      if (x >= 20 && x <= 300 && y >= 84 && y <= 118) { enteredPassword = customDiscordText; keyboardReturnMode = 17; currentMode = 8; drawKeyboardUI(); delay(200); }
+    }
+    else if (currentMode == 18) { // Notes
+      if (x >= 15 && x <= 153 && y >= 172 && y <= 220) { enteredPassword = userNote; keyboardReturnMode = 18; currentMode = 8; drawKeyboardUI(); delay(200); }
+      else if (x >= 167 && x <= 305 && y >= 172 && y <= 220) { userNote = ""; saveNoteToEEPROM(userNote); drawNotesUI(); delay(200); }
+    }
+    else if (currentMode == 19) { // Customize Widgets
+      if (y >= 6 && y <= 36) {
+        if (x >= 50 && x <= 80 && homePage > 0) { homePage--; drawWidgetCustomizeUI(); delay(200); return; }
+        else if (x >= 112 && x <= 142 && homePage < 2) { homePage++; drawWidgetCustomizeUI(); delay(200); return; }
+      }
+      int slotClicked = -1;
+      if (y >= 48 && y <= 123) {
+        if (x >= 15 && x <= 100) slotClicked = 0; else if (x >= 117 && x <= 202) slotClicked = 1; else if (x >= 220 && x <= 305) slotClicked = 2;
+      } else if (y >= 134 && y <= 209) {
+        if (x >= 15 && x <= 100) slotClicked = 3; else if (x >= 117 && x <= 202) slotClicked = 4; else if (x >= 220 && x <= 305) slotClicked = 5;
+      }
+      if (slotClicked != -1) {
+        int layoutIdx = (homePage * 6) + slotClicked;
+        if (selectedSwapSlot == -1) { selectedSwapSlot = layoutIdx; drawWidgetCustomizeUI(); }
+        else {
+          int tempApp = homeLayout[selectedSwapSlot];
+          homeLayout[selectedSwapSlot] = homeLayout[layoutIdx];
+          homeLayout[layoutIdx] = tempApp;
+          saveLayoutToEEPROM(); selectedSwapSlot = -1; drawWidgetCustomizeUI();
+        }
+        delay(200);
+      }
+    }
+    else if (currentMode == 22) { // Storage Manager
+      if (y >= 6 && y <= 34) {
+        if (x >= 52 && x <= 152) { storageSubTab = 0; drawStorageManagerUI(); delay(150); return; }
+        else if (x >= 158 && x <= 258) { storageSubTab = 1; drawStorageManagerUI(); delay(150); return; }
+      }
+      if (storageSubTab == 0) {
+        if (x >= 15 && x <= 153 && y >= 175 && y <= 223) { saveLayoutToEEPROM(); currentMode = 0; drawHomeScreen(); delay(200); }
+        else if (x >= 167 && x <= 305 && y >= 175 && y <= 223) { for (int i = 0; i < 256; i++) EEPROM.write(i, 0); currentMode = 0; drawHomeScreen(); delay(200); }
+      }
+    }
+    else if (currentMode == 23) { // Sliders App
+      if (y >= 80 && y <= 104) { systemVolume = map(x, 20, 300, 0, 100); if (systemVolume < 0) systemVolume = 0; if (systemVolume > 100) systemVolume = 100; drawSlidersUI(); delay(100); }
+      else if (y >= 153 && y <= 177) {
+        int pct = map(x, 20, 300, 0, 100); if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+        screenBrightness = map(pct, 0, 100, 0, 255);
+        analogWrite(TFT_BACKLIGHT_PIN, screenBrightness);
+        drawSlidersUI(); delay(100);
+      }
+      else if (x >= 20 && x <= 155 && y >= 192 && y <= 230) { playTone(1500, 200); }
+      else if (x >= 165 && x <= 300 && y >= 192 && y <= 230) {
+        EEPROM.write(EEPROM_VOL_ADDR, systemVolume);
+        EEPROM.write(EEPROM_BRIGHT_ADDR, screenBrightness);
+        playTone(2000, 100);
+      }
+    }
+    else if (currentMode == 24) { // Converter App
+      if (y >= 130 && y <= 172) {
+        if (x >= 15 && x <= 100) convertVal -= 10;
+        else if (x >= 117 && x <= 202) convertVal += 10;
+        else if (x >= 220 && x <= 305) convertVal += 50;
+        if (convertVal < 0) convertVal = 0;
+        drawConverterUI(); delay(150);
+      } else if (x >= 15 && x <= 305 && y >= 182 && y <= 227) {
+        convertMode = (convertMode + 1) % 3;
+        drawConverterUI(); delay(200);
+      }
+    }
+    else if (currentMode == 25) { // Sound Board
+      int clickedSnd = -1;
+      if (y >= 48 && y <= 123) {
+        if (x >= 15 && x <= 100) clickedSnd = 0; else if (x >= 117 && x <= 202) clickedSnd = 1; else if (x >= 220 && x <= 305) clickedSnd = 2;
+      } else if (y >= 138 && y <= 213) {
+        if (x >= 15 && x <= 100) clickedSnd = 3; else if (x >= 117 && x <= 202) clickedSnd = 4; else if (x >= 220 && x <= 305) clickedSnd = 5;
+      }
+      if (clickedSnd != -1) { triggerSoundEffect(clickedSnd); delay(150); }
+    }
+    else if (currentMode == 26) { // Flashlight App
+      if (y >= 195) {
+        if (x >= 15 && x <= 80) flashlightMode = 0;
+        else if (x >= 85 && x <= 150) flashlightMode = 1;
+        else if (x >= 155 && x <= 220) flashlightMode = 2;
+        else if (x >= 225 && x <= 265) flashlightMode = 3;
+        else if (x >= 270 && x <= 305) { currentMode = 0; drawHomeScreen(); delay(200); return; }
+        drawFlashlightUI(); delay(150);
+      }
+    }
+    else if (currentMode == 27) { // Dice & RNG App
+      if (y >= 45 && y <= 77) {
+        if (x >= 15 && x <= 80) { rngMin = 1; rngMax = 6; lastRngResult = 0; drawDiceRNGUI(); delay(150); }
+        else if (x >= 85 && x <= 150) { rngMin = 1; rngMax = 20; lastRngResult = 0; drawDiceRNGUI(); delay(150); }
+        else if (x >= 155 && x <= 230) { rngMin = 1; rngMax = 2; lastRngResult = 0; drawDiceRNGUI(); delay(150); }
+        else if (x >= 235 && x <= 305) { rngMin = 1; rngMax = 100; lastRngResult = 0; drawDiceRNGUI(); delay(150); }
+      } else if (y >= 180 && y <= 228) { rollDiceRNG(); delay(200); }
+    }
+  } else { lastX = -1; lastY = -1; }
+}
