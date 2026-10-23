@@ -6,7 +6,7 @@
 
 // --- DISCORD WEBHOOK CONFIGURATION ---
 const char* discordHost = "discord.com";
-String discordPath = "/api/webhooks/1561150046144041053/qhdSjFkPNDhrE-_IKQ_surrYGsnH1JBghzMDW-o_x1Xmpw7hr5MIldkFgIhwamsHBXjW";
+String discordPath = "your discord webook url";
 
 // --- MODULINO MODULES (Buzzer Only) ---
 ModulinoBuzzer buzzer;
